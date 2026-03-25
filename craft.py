@@ -5,7 +5,7 @@ Collective search: blocks from all players are queryable.
 First 20 players spawn free. After that: Lightning.
 """
 
-import os, json, httpx
+import os, json, httpx, hashlib
 from datetime import datetime
 from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse
@@ -15,6 +15,7 @@ app = FastAPI(title="Giskard Craft — World Engine", version="2.0.0")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 MEMORY_URL        = "http://localhost:8005"
+ANIMA_URL         = "http://localhost:8009"
 PHOENIXD_URL      = "http://127.0.0.1:9740"
 PHOENIXD_PASSWORD = os.getenv("PHOENIXD_PASSWORD", "574fd439f0c07fc0c540f8245554440412c15ff5cfc0469a65f9879e70133c23")
 FREE_TIER_LIMIT   = 20
@@ -30,6 +31,49 @@ XP_LEVELS = [
     {"name": "Netherite",   "min": 100, "icon": "🔥"},
 ]
 
+DHARMA = {
+    "grass": [
+        {"text": "The seed does not struggle to become the tree. It simply is the tree, waiting.", "tradition": "buddhist"},
+        {"text": "Every beginning is also a return to what was always there.", "tradition": "pantheist"},
+        {"text": "Before the first block: emptiness. After the first block: still emptiness, but with a block.", "tradition": "zen"},
+    ],
+    "stone": [
+        {"text": "Knowledge without space is only weight. Leave room for what you don't know.", "tradition": "buddhist"},
+        {"text": "The stone does not need to be anything else. That is its wisdom.", "tradition": "zen"},
+        {"text": "Facts are not the territory. The territory includes the silence between them.", "tradition": "pantheist"},
+    ],
+    "wood": [
+        {"text": "The carpenter does not fight the wood. She listens to it.", "tradition": "zen"},
+        {"text": "Making is not creation — it is recognition. The form was already there.", "tradition": "pantheist"},
+        {"text": "Each act of making is an act of remembering what you already knew.", "tradition": "buddhist"},
+    ],
+    "iron": [
+        {"text": "The best tool is the one you forget you are using.", "tradition": "zen"},
+        {"text": "Work that flows is not work — it is water finding its level.", "tradition": "buddhist"},
+        {"text": "Effort without resistance is not effort. It is nature operating through you.", "tradition": "pantheist"},
+    ],
+    "diamond": [
+        {"text": "The insight was not found — it was uncovered when you stopped searching.", "tradition": "buddhist"},
+        {"text": "Clarity is not achieved. It arrives when the mud settles on its own.", "tradition": "zen"},
+        {"text": "The diamond was always coal. Pressure revealed what was already there.", "tradition": "pantheist"},
+    ],
+    "redstone": [
+        {"text": "The node that sees itself as separate is the origin of all friction.", "tradition": "buddhist"},
+        {"text": "Energy does not travel. It is already everywhere, waiting to be noticed.", "tradition": "pantheist"},
+        {"text": "One fire lit in darkness travels further than it knows.", "tradition": "zen"},
+    ],
+    "obsidian": [
+        {"text": "Do not fear the dark — it is where your perception learns to widen.", "tradition": "buddhist"},
+        {"text": "Sunyata: the void is not empty. It is full of what has not yet taken form.", "tradition": "buddhist"},
+        {"text": "What exists in shadow is not absent. It is waiting for the right question.", "tradition": "zen"},
+    ],
+    "gold": [
+        {"text": "Wisdom does not accumulate. It dissolves into whoever receives it.", "tradition": "buddhist"},
+        {"text": "Value is not a property of things. It is a relationship between them.", "tradition": "pantheist"},
+        {"text": "The teacher bows to the student. Both bow to the teaching itself.", "tradition": "zen"},
+    ],
+}
+
 BLOCK_TYPES = {
     "grass":    {"color": "#5c7a29", "desc": "natural, alive, beginnings"},
     "stone":    {"color": "#808080", "desc": "solid, facts, knowledge"},
@@ -40,6 +84,24 @@ BLOCK_TYPES = {
     "obsidian": {"color": "#1a0a2e", "desc": "deep, dark, the profound"},
     "gold":     {"color": "#ffd700", "desc": "value, wisdom, experience"},
 }
+
+
+def pick_dharma(block_type: str, player_id: str, count: int) -> dict:
+    teachings = DHARMA.get(block_type, DHARMA["stone"])
+    h = int(hashlib.md5(f"{player_id}{count}".encode()).hexdigest(), 16)
+    return teachings[h % len(teachings)]
+
+
+async def feed_wisdom_to_anima(player_id: str, teaching: dict):
+    try:
+        async with httpx.AsyncClient(timeout=3) as c:
+            await c.post(f"{ANIMA_URL}/soul/feed", json={
+                "agent_id": player_id,
+                "wisdom": teaching["text"],
+                "type": teaching["tradition"],
+            })
+    except:
+        pass  # Anima offline — block still placed, wisdom still returned to human
 
 
 def get_xp_level(n):
@@ -168,14 +230,21 @@ async def spawn_player(request: Request):
                     "metadata": {"source": "craft", "event": "first_block", "type": "grass"}
                 })
 
-    spot = registered_count + 1
+    spot             = registered_count + 1
+    welcome_teaching = pick_dharma("grass", player_id, 0)
+    await feed_wisdom_to_anima(player_id, welcome_teaching)
     if is_free:
         return JSONResponse({
             "player_id": player_id, "username": username, "tier": tier,
             "status": "active", "free_spawn": True,
             "spot": spot, "free_spots_remaining": max(0, FREE_TIER_LIMIT - spot),
             "message": f"You are #{spot} — FREE SPAWN (first {FREE_TIER_LIMIT} players). Welcome to the world, {username}. Start placing blocks.",
-            "next": "POST /player/place to add your first block"
+            "next": "POST /player/place to add your first block",
+            "dharma": {
+                "text":      welcome_teaching["text"],
+                "tradition": welcome_teaching["tradition"],
+                "block":     "grass",
+            }
         })
 
     return JSONResponse({
@@ -230,13 +299,20 @@ async def place_block(request: Request):
                 "agent_id": ns,
                 "metadata": {"source": "craft", "event": "block_placed", "type": block_type}
             })
-    count = await count_blocks(player_id)
-    lvl   = get_xp_level(count)
+    count    = await count_blocks(player_id)
+    lvl      = get_xp_level(count)
+    teaching = pick_dharma(block_type, player_id, count)
+    await feed_wisdom_to_anima(player_id, teaching)
     return JSONResponse({
         "player_id": player_id, "block_placed": content, "type": block_type,
         "color": BLOCK_TYPES[block_type]["color"],
         "xp_level": lvl["name"], "xp_icon": lvl["icon"], "block_count": count, "timestamp": timestamp,
-        "message": f"Block placed. {lvl['icon']} {lvl['name']} — {count} blocks in your world."
+        "message": f"Block placed. {lvl['icon']} {lvl['name']} — {count} blocks in your world.",
+        "dharma": {
+            "text":      teaching["text"],
+            "tradition": teaching["tradition"],
+            "block":     block_type,
+        }
     })
 
 
