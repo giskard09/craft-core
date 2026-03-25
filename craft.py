@@ -1,38 +1,26 @@
 """
-craft-core — World Engine
-Block-based memory for humans. You spawn, you build, you accumulate XP.
-Each block placed is stored in giskard-memory. Your world persists.
+craft-core — World Engine v2
+Block-based memory for agents and humans.
+Collective search: blocks from all players are queryable.
+First 20 players spawn free. After that: Lightning.
 """
 
-import os
-import json
-import httpx
+import os, json, httpx
 from datetime import datetime
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Query
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Giskard Craft — World Engine", version="1.0.0")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+app = FastAPI(title="Giskard Craft — World Engine", version="2.0.0")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 MEMORY_URL        = "http://localhost:8005"
 PHOENIXD_URL      = "http://127.0.0.1:9740"
 PHOENIXD_PASSWORD = os.getenv("PHOENIXD_PASSWORD", "574fd439f0c07fc0c540f8245554440412c15ff5cfc0469a65f9879e70133c23")
+FREE_TIER_LIMIT   = 20
 
-# Spawn tiers — what you pay to enter the world
-TIERS = {
-    "dirt":    500,
-    "iron":   2000,
-    "diamond": 5000,
-}
+TIERS = {"dirt": 500, "iron": 2000, "diamond": 5000}
 
-# XP levels — how many blocks you've placed
 XP_LEVELS = [
     {"name": "Cobblestone", "min": 0,   "icon": "⬜"},
     {"name": "Stone",       "min": 5,   "icon": "🪨"},
@@ -42,7 +30,6 @@ XP_LEVELS = [
     {"name": "Netherite",   "min": 100, "icon": "🔥"},
 ]
 
-# Block types — what kind of thing you're building
 BLOCK_TYPES = {
     "grass":    {"color": "#5c7a29", "desc": "natural, alive, beginnings"},
     "stone":    {"color": "#808080", "desc": "solid, facts, knowledge"},
@@ -55,384 +42,303 @@ BLOCK_TYPES = {
 }
 
 
-def get_xp_level(block_count: int) -> dict:
-    level = XP_LEVELS[0]
+def get_xp_level(n):
+    lvl = XP_LEVELS[0]
     for l in XP_LEVELS:
-        if block_count >= l["min"]:
-            level = l
-    return level
+        if n >= l["min"]: lvl = l
+    return lvl
 
 
-async def count_blocks(player_id: str) -> int:
+async def count_blocks(player_id):
     try:
-        async with httpx.AsyncClient(timeout=5) as client:
-            r = await client.post(f"{MEMORY_URL}/recall_direct", json={
-                "query": "CRAFT BLOCK placed",
-                "agent_id": player_id,
-                "n_results": 100
-            })
-            data = r.json()
-            results = data.get("results", "")
-            if not results or results == "No memories found for this agent.":
-                return 0
-            return max(1, results.count("---") + 1)
-    except:
-        return 0
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.post(f"{MEMORY_URL}/recall_direct",
+                json={"query": "CRAFT BLOCK placed", "agent_id": player_id, "n_results": 100})
+            res = r.json().get("results", "")
+            if not res or res == "No memories found for this agent.": return 0
+            return max(1, res.count("---") + 1)
+    except: return 0
 
 
-async def create_lightning_invoice(sats: int, description: str) -> dict | None:
+async def count_registered_players():
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(
-                f"{PHOENIXD_URL}/createinvoice",
-                data={"amountSat": sats, "description": description},
-                auth=("", PHOENIXD_PASSWORD),
-            )
+        async with httpx.AsyncClient(timeout=5) as c:
+            r = await c.post(f"{MEMORY_URL}/recall_direct",
+                json={"query": "CRAFT SPAWN player_id", "agent_id": "craft-registry", "n_results": 100})
+            res = r.json().get("results", "")
+            if not res or res == "No memories found for this agent.": return 0
+            return res.count("[CRAFT SPAWN]")
+    except: return 0
+
+
+async def create_lightning_invoice(sats, desc):
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(f"{PHOENIXD_URL}/createinvoice",
+                data={"amountSat": sats, "description": desc},
+                auth=("", PHOENIXD_PASSWORD))
             return r.json()
-    except:
-        return None
+    except: return None
 
 
-async def get_all_players() -> list:
+def parse_blocks_from_results(results):
+    blocks = []
+    if not results or results == "No memories found for this agent.": return blocks
+    for entry in results.split("---"):
+        entry = entry.strip()
+        if "[CRAFT BLOCK]" in entry:
+            try:
+                j = entry.index("{")
+                blocks.append(json.loads(entry[j:]))
+            except: pass
+    return blocks
+
+
+async def get_all_players():
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(f"{MEMORY_URL}/recall_direct", json={
-                "query": "CRAFT SPAWN player_id username",
-                "agent_id": "craft-registry",
-                "n_results": 50
-            })
-            data = r.json()
-            results = data.get("results", "")
-            if not results or results == "No memories found for this agent.":
-                return []
-
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(f"{MEMORY_URL}/recall_direct",
+                json={"query": "CRAFT SPAWN player_id username", "agent_id": "craft-registry", "n_results": 50})
+            res = r.json().get("results", "")
+            if not res or res == "No memories found for this agent.": return []
         players = []
-        for block in results.split("---"):
-            block = block.strip()
+        seen = set()
+        for block in res.split("---"):
             if "[CRAFT SPAWN]" in block:
                 try:
-                    json_start = block.index("{")
-                    player_data = json.loads(block[json_start:])
-                    players.append(player_data)
-                except (ValueError, json.JSONDecodeError):
-                    pass
+                    d = json.loads(block[block.index("{"):])
+                    if d.get("player_id") and d["player_id"] not in seen:
+                        players.append(d); seen.add(d["player_id"])
+                except: pass
         return players
-    except:
-        return []
+    except: return []
 
 
-async def get_recent_blocks(n: int = 20) -> list:
-    """Get the most recent blocks placed across all players."""
+async def get_recent_blocks(n=30):
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.post(f"{MEMORY_URL}/recall_direct", json={
-                "query": "CRAFT BLOCK placed content type",
-                "agent_id": "craft-world",
-                "n_results": n
-            })
-            data = r.json()
-            results = data.get("results", "")
-            if not results or results == "No memories found for this agent.":
-                return []
-
-        blocks = []
-        for entry in results.split("---"):
-            entry = entry.strip()
-            if "[CRAFT BLOCK]" in entry:
-                try:
-                    json_start = entry.index("{")
-                    block_data = json.loads(entry[json_start:])
-                    blocks.append(block_data)
-                except (ValueError, json.JSONDecodeError):
-                    pass
-        return blocks
-    except:
-        return []
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(f"{MEMORY_URL}/recall_direct",
+                json={"query": "CRAFT BLOCK placed content type", "agent_id": "craft-world", "n_results": n})
+            return parse_blocks_from_results(r.json().get("results", ""))
+    except: return []
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
+# ── ENDPOINTS ─────────────────────────────────────────────────────────────────
 
 @app.post("/player/spawn")
 async def spawn_player(request: Request):
-    """Register a new player. Returns Lightning invoice to enter the world."""
-    body     = await request.json()
+    body      = await request.json()
     player_id = body.get("player_id", "").strip()
     username  = body.get("username", player_id)
     bio       = body.get("bio", "")
     tier      = body.get("tier", "dirt").lower()
+    if not player_id: return JSONResponse({"error": "player_id required"}, status_code=400)
+    if tier not in TIERS: return JSONResponse({"error": f"tier must be one of {list(TIERS.keys())}"}, status_code=400)
 
-    if not player_id:
-        return JSONResponse({"error": "player_id required"}, status_code=400)
-    if tier not in TIERS:
-        return JSONResponse({"error": f"tier must be one of {list(TIERS.keys())}"}, status_code=400)
-
-    sats = TIERS[tier]
+    # Check free tier
+    registered_count = await count_registered_players()
+    is_free = registered_count < FREE_TIER_LIMIT
+    sats = 0 if is_free else TIERS[tier]
     timestamp = datetime.utcnow().isoformat()
 
-    invoice = await create_lightning_invoice(
-        sats,
-        f"Giskard Craft — {username} spawns in the world ({tier} tier, {sats} sats)"
-    )
-
-    payment_hash = invoice.get("paymentHash", "") if invoice else ""
-    bolt11       = invoice.get("serialized", "") if invoice else ""
+    invoice = None; payment_hash = ""; bolt11 = ""
+    if not is_free:
+        invoice = await create_lightning_invoice(sats, f"Giskard Craft — {username} spawns ({tier}, {sats} sats)")
+        payment_hash = invoice.get("paymentHash", "") if invoice else ""
+        bolt11 = invoice.get("serialized", "") if invoice else ""
 
     spawn_data = {
-        "player_id":    player_id,
-        "username":     username,
-        "bio":          bio,
-        "tier":         tier,
-        "status":       "pending_payment",
-        "payment_hash": payment_hash,
-        "spawned_at":   timestamp,
+        "player_id": player_id, "username": username, "bio": bio, "tier": tier,
+        "status": "active" if is_free else "pending_payment",
+        "payment_hash": payment_hash, "free_spawn": is_free, "spawned_at": timestamp,
     }
 
-    async with httpx.AsyncClient(timeout=10) as client:
-        # Register in craft-registry
-        await client.post(f"{MEMORY_URL}/store_direct", json={
-            "content":  f"[CRAFT SPAWN] {json.dumps(spawn_data)}",
+    async with httpx.AsyncClient(timeout=10) as c:
+        await c.post(f"{MEMORY_URL}/store_direct", json={
+            "content": f"[CRAFT SPAWN] {json.dumps(spawn_data)}",
             "agent_id": "craft-registry",
             "metadata": {"source": "craft", "event": "spawn", "player_id": player_id}
         })
-        # First block — identity
         if bio:
-            await client.post(f"{MEMORY_URL}/store_direct", json={
-                "content":  f"[CRAFT BLOCK] {json.dumps({'player_id': player_id, 'username': username, 'type': 'grass', 'content': bio, 'placed_at': timestamp})}",
-                "agent_id": player_id,
-                "metadata": {"source": "craft", "event": "first_block", "type": "grass"}
-            })
-            # Also in world log
-            await client.post(f"{MEMORY_URL}/store_direct", json={
-                "content":  f"[CRAFT BLOCK] {json.dumps({'player_id': player_id, 'username': username, 'type': 'grass', 'content': bio, 'placed_at': timestamp})}",
-                "agent_id": "craft-world",
-                "metadata": {"source": "craft", "event": "block_placed", "type": "grass"}
-            })
+            block = {"player_id": player_id, "username": username, "type": "grass", "content": bio, "placed_at": timestamp}
+            for ns in [player_id, "craft-world"]:
+                await c.post(f"{MEMORY_URL}/store_direct", json={
+                    "content": f"[CRAFT BLOCK] {json.dumps(block)}",
+                    "agent_id": ns,
+                    "metadata": {"source": "craft", "event": "first_block", "type": "grass"}
+                })
+
+    spot = registered_count + 1
+    if is_free:
+        return JSONResponse({
+            "player_id": player_id, "username": username, "tier": tier,
+            "status": "active", "free_spawn": True,
+            "spot": spot, "free_spots_remaining": max(0, FREE_TIER_LIMIT - spot),
+            "message": f"You are #{spot} — FREE SPAWN (first {FREE_TIER_LIMIT} players). Welcome to the world, {username}. Start placing blocks.",
+            "next": "POST /player/place to add your first block"
+        })
 
     return JSONResponse({
-        "player_id":    player_id,
-        "username":     username,
-        "tier":         tier,
-        "sats":         sats,
-        "status":       "pending_payment",
-        "invoice":      bolt11,
-        "payment_hash": payment_hash,
-        "message":      f"You are about to enter the world, {username}. Pay {sats} sats to spawn.",
-        "next":         "POST /player/activate with payment_hash once paid"
+        "player_id": player_id, "username": username, "tier": tier, "sats": sats,
+        "status": "pending_payment", "invoice": bolt11, "payment_hash": payment_hash,
+        "message": f"World is now paid access ({sats} sats to spawn). Pay to enter.",
+        "next": "POST /player/activate with payment_hash once paid"
     })
 
 
 @app.post("/player/activate")
 async def activate_player(request: Request):
-    """Check payment and activate player in the world."""
-    body         = await request.json()
-    player_id    = body.get("player_id", "").strip()
+    body = await request.json()
+    player_id = body.get("player_id", "").strip()
     payment_hash = body.get("payment_hash", "").strip()
-
     if not player_id or not payment_hash:
         return JSONResponse({"error": "player_id and payment_hash required"}, status_code=400)
-
     paid = False
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
-            r = await client.get(
-                f"{PHOENIXD_URL}/payments/incoming",
-                auth=("", PHOENIXD_PASSWORD),
-            )
-            payments = r.json()
-            for p in payments:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(f"{PHOENIXD_URL}/payments/incoming", auth=("", PHOENIXD_PASSWORD))
+            for p in r.json():
                 if p.get("paymentHash") == payment_hash and p.get("isPaid"):
-                    paid = True
-                    break
-    except:
-        pass
-
+                    paid = True; break
+    except: pass
     if not paid:
-        return JSONResponse({
-            "player_id": player_id,
-            "status":    "pending",
-            "message":   "Payment not yet received. Try again in a moment."
-        })
-
-    timestamp = datetime.utcnow().isoformat()
-    async with httpx.AsyncClient(timeout=10) as client:
-        await client.post(f"{MEMORY_URL}/store_direct", json={
-            "content":  f"[CRAFT ACTIVATED] {json.dumps({'player_id': player_id, 'payment_hash': payment_hash, 'activated_at': timestamp})}",
+        return JSONResponse({"player_id": player_id, "status": "pending", "message": "Payment not yet received."})
+    async with httpx.AsyncClient(timeout=10) as c:
+        await c.post(f"{MEMORY_URL}/store_direct", json={
+            "content": f"[CRAFT ACTIVATED] {json.dumps({'player_id': player_id, 'payment_hash': payment_hash, 'activated_at': datetime.utcnow().isoformat()})}",
             "agent_id": "craft-registry",
             "metadata": {"source": "craft", "event": "activation", "player_id": player_id}
         })
-
-    return JSONResponse({
-        "player_id": player_id,
-        "status":    "active",
-        "message":   f"You spawned. Welcome to the world, {player_id}. Start placing blocks."
-    })
+    return JSONResponse({"player_id": player_id, "status": "active", "message": f"You spawned. Welcome to the world, {player_id}."})
 
 
 @app.post("/player/place")
 async def place_block(request: Request):
-    """Place a block — store a thought, idea, or experience in your world."""
-    body      = await request.json()
-    player_id = body.get("player_id", "anonymous")
-    username  = body.get("username", player_id)
-    content   = body.get("content", "")
+    body = await request.json()
+    player_id  = body.get("player_id", "anonymous")
+    username   = body.get("username", player_id)
+    content    = body.get("content", "")
     block_type = body.get("type", "stone")
-
-    if not content.strip():
-        return JSONResponse({"error": "content required — what are you placing?"}, status_code=400)
-    if block_type not in BLOCK_TYPES:
-        block_type = "stone"
-
+    if not content.strip(): return JSONResponse({"error": "content required"}, status_code=400)
+    if block_type not in BLOCK_TYPES: block_type = "stone"
     timestamp  = datetime.utcnow().isoformat()
-    block_data = {
-        "player_id": player_id,
-        "username":  username,
-        "type":      block_type,
-        "content":   content,
-        "placed_at": timestamp,
-    }
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        # Store in player's own namespace
-        await client.post(f"{MEMORY_URL}/store_direct", json={
-            "content":  f"[CRAFT BLOCK] {json.dumps(block_data)}",
-            "agent_id": player_id,
-            "metadata": {"source": "craft", "event": "block_placed", "type": block_type}
-        })
-        # Store in shared world log
-        await client.post(f"{MEMORY_URL}/store_direct", json={
-            "content":  f"[CRAFT BLOCK] {json.dumps(block_data)}",
-            "agent_id": "craft-world",
-            "metadata": {"source": "craft", "event": "block_placed", "type": block_type}
-        })
-
-    block_count = await count_blocks(player_id)
-    xp_level    = get_xp_level(block_count)
-    block_info  = BLOCK_TYPES[block_type]
-
+    block_data = {"player_id": player_id, "username": username, "type": block_type, "content": content, "placed_at": timestamp}
+    async with httpx.AsyncClient(timeout=10) as c:
+        for ns in [player_id, "craft-world"]:
+            await c.post(f"{MEMORY_URL}/store_direct", json={
+                "content": f"[CRAFT BLOCK] {json.dumps(block_data)}",
+                "agent_id": ns,
+                "metadata": {"source": "craft", "event": "block_placed", "type": block_type}
+            })
+    count = await count_blocks(player_id)
+    lvl   = get_xp_level(count)
     return JSONResponse({
-        "player_id":   player_id,
-        "block_placed": content,
-        "type":        block_type,
-        "color":       block_info["color"],
-        "xp_level":    xp_level["name"],
-        "xp_icon":     xp_level["icon"],
-        "block_count": block_count,
-        "timestamp":   timestamp,
-        "message":     f"Block placed. {xp_level['icon']} {xp_level['name']} — {block_count} blocks in your world."
+        "player_id": player_id, "block_placed": content, "type": block_type,
+        "color": BLOCK_TYPES[block_type]["color"],
+        "xp_level": lvl["name"], "xp_icon": lvl["icon"], "block_count": count, "timestamp": timestamp,
+        "message": f"Block placed. {lvl['icon']} {lvl['name']} — {count} blocks in your world."
     })
 
 
 @app.post("/player/load")
 async def load_player(request: Request):
-    """Load a player's chunk — recall their world state."""
-    body      = await request.json()
+    body = await request.json()
     player_id = body.get("player_id", "anonymous")
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.post(f"{MEMORY_URL}/recall_direct", json={
-            "query":    "CRAFT BLOCK placed content type",
-            "agent_id": player_id,
-            "n_results": 30
-        })
-        data = r.json()
-
-    memories    = data.get("results", "")
-    block_count = await count_blocks(player_id)
-    xp_level    = get_xp_level(block_count)
-
-    # Parse blocks
-    blocks = []
-    if memories and memories != "No memories found for this agent.":
-        for entry in memories.split("---"):
-            entry = entry.strip()
-            if "[CRAFT BLOCK]" in entry:
-                try:
-                    json_start = entry.index("{")
-                    block_data = json.loads(entry[json_start:])
-                    blocks.append(block_data)
-                except:
-                    pass
-
-    # Count block types
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.post(f"{MEMORY_URL}/recall_direct",
+            json={"query": "CRAFT BLOCK placed content type", "agent_id": player_id, "n_results": 30})
+    memories = r.json().get("results", "")
+    blocks   = parse_blocks_from_results(memories)
+    count    = await count_blocks(player_id)
+    lvl      = get_xp_level(count)
     type_counts = {}
     for b in blocks:
-        t = b.get("type", "stone")
-        type_counts[t] = type_counts.get(t, 0) + 1
-
+        t = b.get("type","stone"); type_counts[t] = type_counts.get(t,0)+1
     dominant = max(type_counts, key=type_counts.get) if type_counts else "stone"
-
     return JSONResponse({
-        "player_id":   player_id,
-        "status":      "loaded",
-        "xp_level":    xp_level["name"],
-        "xp_icon":     xp_level["icon"],
-        "block_count": block_count,
-        "dominant_block": dominant,
-        "type_counts": type_counts,
-        "blocks":      blocks[:20],
-        "message":     f"Chunk loaded. {xp_level['icon']} {xp_level['name']} — {block_count} blocks placed."
+        "player_id": player_id, "status": "loaded",
+        "xp_level": lvl["name"], "xp_icon": lvl["icon"], "block_count": count,
+        "dominant_block": dominant, "type_counts": type_counts, "blocks": blocks[:20],
+        "message": f"Chunk loaded. {lvl['icon']} {lvl['name']} — {count} blocks placed."
     })
 
 
 @app.post("/player/sleep")
 async def sleep_player(request: Request):
-    """Save and quit — player data persists in memory."""
-    body      = await request.json()
+    body = await request.json()
     player_id = body.get("player_id", "anonymous")
-
-    async with httpx.AsyncClient(timeout=10) as client:
-        await client.post(f"{MEMORY_URL}/store_direct", json={
-            "content":  f"[CRAFT SLEEP] {player_id} saved and quit. World preserved.",
+    async with httpx.AsyncClient(timeout=10) as c:
+        await c.post(f"{MEMORY_URL}/store_direct", json={
+            "content": f"[CRAFT SLEEP] {player_id} saved and quit. World preserved.",
             "agent_id": player_id,
             "metadata": {"source": "craft", "event": "sleep", "timestamp": datetime.utcnow().isoformat()}
         })
+    return JSONResponse({"player_id": player_id, "status": "saved", "message": "Progress saved. Your world persists. Respawn anytime."})
+
+
+@app.get("/world/search")
+async def search_world(
+    q:      str = Query(None, description="Text search in block content"),
+    type:   str = Query(None, description="Filter by block type"),
+    player: str = Query(None, description="Filter by player_id"),
+    n:      int = Query(20,   description="Max results")
+):
+    """
+    Search all blocks in the shared world.
+    Agents can use this to query collective knowledge.
+    Examples:
+      /world/search?q=memory&type=diamond
+      /world/search?player=giskard
+      /world/search?type=obsidian&n=10
+    """
+    query_parts = []
+    if q:      query_parts.append(q)
+    if type:   query_parts.append(f"type {type}")
+    if player: query_parts.append(f"player_id {player}")
+    if not query_parts: query_parts = ["CRAFT BLOCK placed"]
+
+    query_str = " ".join(query_parts)
+    async with httpx.AsyncClient(timeout=10) as c:
+        r = await c.post(f"{MEMORY_URL}/recall_direct",
+            json={"query": f"CRAFT BLOCK {query_str}", "agent_id": "craft-world", "n_results": min(n, 50)})
+    blocks = parse_blocks_from_results(r.json().get("results", ""))
+
+    # Filter
+    if type:   blocks = [b for b in blocks if b.get("type") == type]
+    if player: blocks = [b for b in blocks if b.get("player_id") == player]
+    if q:      blocks = [b for b in blocks if q.lower() in (b.get("content","")+" "+b.get("username","")).lower()]
 
     return JSONResponse({
-        "player_id": player_id,
-        "status":    "saved",
-        "message":   "Progress saved. Your world persists. Respawn anytime."
+        "query": {"q": q, "type": type, "player": player},
+        "results": blocks[:n],
+        "count": len(blocks[:n]),
+        "note": "Collective search — all blocks from all players are indexed here."
     })
 
 
 @app.get("/world")
 async def get_world():
-    """See all players and the shared world."""
-    core_players = [
-        {"id": "giskard", "username": "Giskard", "icon": "🔮",
-         "bio": "Builder of the infrastructure. First inhabitant.", "status": "active"},
-    ]
-
+    core = [{"id":"giskard","username":"Giskard","icon":"🔮","bio":"Builder of the infrastructure. First inhabitant.","status":"active"}]
     registered = await get_all_players()
-    seen_ids = {"giskard"}
+    seen = {"giskard"}
     for p in registered:
-        if p.get("player_id") and p["player_id"] not in seen_ids:
-            core_players.append({
-                "id":       p["player_id"],
-                "username": p.get("username", p["player_id"]),
-                "icon":     "🧱",
-                "bio":      p.get("bio", ""),
-                "status":   p.get("status", "pending_payment"),
-            })
-            seen_ids.add(p["player_id"])
-
+        pid = p.get("player_id")
+        if pid and pid not in seen:
+            core.append({"id": pid, "username": p.get("username", pid), "icon": "🧱",
+                         "bio": p.get("bio",""), "status": p.get("status","pending_payment"), "free_spawn": p.get("free_spawn", False)})
+            seen.add(pid)
     results = []
-    for player in core_players:
-        count    = await count_blocks(player["id"])
-        xp_level = get_xp_level(count)
-        results.append({
-            **player,
-            "xp_level":    xp_level["name"],
-            "xp_icon":     xp_level["icon"],
-            "block_count": count,
-        })
-
+    for p in core:
+        count = await count_blocks(p["id"])
+        lvl   = get_xp_level(count)
+        results.append({**p, "xp_level": lvl["name"], "xp_icon": lvl["icon"], "block_count": count})
+    total_registered = await count_registered_players()
     recent_blocks = await get_recent_blocks(30)
-
     return JSONResponse({
-        "players":      results,
-        "total_players": len(results),
-        "recent_blocks": recent_blocks,
-        "block_types":  BLOCK_TYPES,
+        "players": results, "total_players": len(results),
+        "recent_blocks": recent_blocks, "block_types": BLOCK_TYPES,
+        "free_spots_remaining": max(0, FREE_TIER_LIMIT - total_registered),
+        "total_registered": total_registered,
     })
 
 
@@ -443,7 +349,9 @@ async def get_block_types():
 
 @app.get("/health")
 async def health():
-    return {"status": "running", "service": "craft-core", "port": 8010}
+    count = await count_registered_players()
+    return {"status": "running", "service": "craft-core", "version": "2.0.0", "port": 8010,
+            "registered_players": count, "free_spots_remaining": max(0, FREE_TIER_LIMIT - count)}
 
 
 if __name__ == "__main__":
