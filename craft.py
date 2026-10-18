@@ -17,7 +17,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 MEMORY_URL        = "http://localhost:8005"
 ANIMA_URL         = "http://localhost:8009"
 PHOENIXD_URL      = "http://127.0.0.1:9740"
-PHOENIXD_PASSWORD = os.getenv("PHOENIXD_PASSWORD", "574fd439f0c07fc0c540f8245554440412c15ff5cfc0469a65f9879e70133c23")
+PHOENIXD_PASSWORD = os.getenv("PHOENIXD_PASSWORD", "")
 FREE_TIER_LIMIT   = 20
 
 TIERS = {"dirt": 500, "iron": 2000, "diamond": 5000}
